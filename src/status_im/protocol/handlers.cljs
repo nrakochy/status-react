@@ -138,7 +138,7 @@
                        (string/join " ")
                        (system-message message-id timestamp))
           message' (assoc message :group-id group-id)]
-      (re-frame/dispatch [:received-message message']))))
+      (re-frame/dispatch [:chat-received-message/add [message']]))))
 
 (re-frame/reg-fx
   ::chats-add-contact
@@ -165,7 +165,7 @@
                         (string/join " ")
                         (system-message message-id timestamp))
           message' (assoc message :group-id group-id)]
-      (re-frame/dispatch [:received-message message']))))
+      (re-frame/dispatch [:chat-received-message/add [message']]))))
 
 (re-frame/reg-fx
   ::stop-watching-group!
@@ -173,49 +173,50 @@
     (protocol/stop-watching-group! params)))
 
 (re-frame/reg-fx
-  ::participant-left-group-message
-  (fn [{:keys [chat-id from message-id timestamp]}]
-    (let [left-name (:name (contacts/get-by-id from))]
-      (->> (str (or left-name from) " " (i18n/label :t/left))
-           (system-message message-id timestamp)
-           (messages/save chat-id)))))
+ ::participant-left-group-message
+ (fn [{:keys [chat-id from message-id timestamp]}]
+   (let [left-name (:name (contacts/get-by-id from))
+         message-text (str (or left-name from) " " (label :t/left))]
+     (-> (system-message message-id timestamp message-text)
+         (assoc :chat-id chat-id)
+         (messages/save)))))
 
 (re-frame/reg-fx
-  ::participant-invited-to-group-message
-  (fn [{:keys [chat-id current-identity identity from message-id timestamp]}]
-    (let [inviter-name (:name (contacts/get-by-id from))
-          invitee-name (if (= identity current-identity)
-                         (i18n/label :t/You)
-                         (:name (contacts/get-by-id identity)))]
-      (re-frame/dispatch
-        [:received-message
-         {:from         "system"
-          :group-id     chat-id
-          :timestamp    timestamp
-          :message-id   message-id
-          :content      (str (or inviter-name from) " " (i18n/label :t/invited) " " (or invitee-name identity))
-          :content-type constants/text-content-type}]))))
+ ::participant-invited-to-group-message
+ (fn [{:keys [chat-id current-identity identity from message-id timestamp]}]
+   (let [inviter-name (:name (contacts/get-by-id from))
+         invitee-name (if (= identity current-identity)
+                        (i18n/label :t/You)
+                        (:name (contacts/get-by-id identity)))]
+     (re-frame/dispatch
+      [:chat-received-message/add
+       [{:from         "system"
+         :group-id     chat-id
+         :timestamp    timestamp
+         :message-id   message-id
+         :content      (str (or inviter-name from) " " (i18n/label :t/invited) " " (or invitee-name identity))
+         :content-type constants/text-content-type}]]))))
 
 (re-frame/reg-fx
-  ::save-message-status!
-  (fn [{:keys [message-id ack-of-message group-id from status]}]
-    (let [message-id' (or ack-of-message message-id)]
-      (when-let [{:keys [message-status] :as message} (messages/get-by-id message-id')]
-        (when-not (= (keyword message-status) :seen)
-          (let [group?   (boolean group-id)
-                message' (-> (if (and group? (not= status :sent))
-                               (update-in message
-                                          [:user-statuses from]
-                                          (fn [{old-status :status}]
-                                            {:id               (random/id)
-                                             :whisper-identity from
-                                             :status           (if (= (keyword old-status) :seen)
-                                                                 old-status
-                                                                 status)}))
-                               (assoc message :message-status status))
-                             ;; we need to dissoc preview because it has been saved before
-                             (dissoc :preview))]
-            (messages/update-message message')))))))
+ ::save-message-status!
+ (fn [{:keys [message-id ack-of-message group-id from status]}]
+   (let [message-id' (or ack-of-message message-id)]
+     (when-let [{:keys [message-status] :as message} (messages/get-by-id message-id')]
+       (when-not (= (keyword message-status) :seen)
+         (let [group?   (boolean group-id)
+               message' (-> (if (and group? (not= status :sent))
+                              (update-in message
+                                         [:user-statuses from]
+                                         (fn [{old-status :status}]
+                                           {:id               (random/id)
+                                            :whisper-identity from
+                                            :status           (if (= (keyword old-status) :seen)
+                                                                old-status
+                                                                status)}))
+                              (assoc message :message-status status))
+                            ;; we need to dissoc preview because it has been saved before
+                            (dissoc :preview))]
+           (messages/update-message message')))))))
 
 (re-frame/reg-fx
   ::pending-messages-delete
@@ -223,12 +224,12 @@
     (pending-messages/delete message)))
 
 (re-frame/reg-fx
-  ::pending-messages-save
-  (fn [{:keys [type id pending-message]}]
-    (pending-messages/save pending-message)
-    (when (#{:message :group-message} type)
-      (messages/update-message {:message-id id
-                                :delivery-status    :pending}))))
+ ::pending-messages-save
+ (fn [{:keys [type id pending-message]}]
+   (pending-messages/save pending-message)
+   (when (#{:message :group-message} type)
+     (messages/update-message {:message-id id
+                               :delivery-status :pending}))))
 
 (re-frame/reg-fx
   ::status-init-jail
@@ -320,9 +321,9 @@
                                  :type       type
                                  :ttl        (+ (datetime/now-ms) ttl-s)}
               route-event (case type
-                            :message               [:received-protocol-message! message]
-                            :group-message         [:received-protocol-message! message]
-                            :public-group-message  [:received-protocol-message! message]
+                            :message               [:chat-received-message/add-protocol-message message]
+                            :group-message         [:chat-received-message/add-protocol-message message]
+                            :public-group-message  [:chat-received-message/add-protocol-message message]
                             :ack                   (if (#{:message :group-message} (:type payload))
                                                      [:update-message-status message :delivered]
                                                      [:pending-message-remove message])

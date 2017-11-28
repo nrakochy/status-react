@@ -1,7 +1,7 @@
 (ns status-im.chat.events.sign-up
   (:require [re-frame.core :as re-frame]
             [status-im.constants :as const]
-            [status-im.chat.sign-up :as sign-up]
+            [status-im.chat.console :as console-chat]
             [status-im.utils.handlers :as handlers]
             [status-im.utils.phone-number :as phone-number-util]
             [status-im.utils.sms-listener :as sms-listener]
@@ -38,10 +38,10 @@
 ;;;; Handlers
 
 (handlers/register-handler-fx
-  ::sign-up
-  [re-frame/trim-v]
-  (fn [{:keys [db]} [phone-number message-id]]
-    (sign-up db phone-number message-id)))
+ ::sign-up
+ [re-frame/trim-v]
+ (fn [{:keys [db]} [phone-number message-id]]
+   (sign-up db phone-number message-id)))
 
 (defn- message-seen [{:keys [db] :as fx} message-id]
   (-> fx
@@ -50,12 +50,12 @@
                               :message-status :seen})))
 
 (handlers/register-handler-fx
-  :start-listening-confirmation-code-sms
-  [re-frame/trim-v]
-  (fn [{:keys [db]} [sms-listener]]
-    {:db (if-not (:confirmation-code-sms-listener db)
-           (assoc db :confirmation-code-sms-listener sms-listener)
-           db)}))
+ :start-listening-confirmation-code-sms
+ [re-frame/trim-v]
+ (fn [{:keys [db]} [sms-listener]]
+   {:db (if-not (:confirmation-code-sms-listener db)
+          (assoc db :confirmation-code-sms-listener sms-listener)
+          db)}))
 
 (defn stop-listening-confirmation-code-sms [{:keys [db] :as fx}]
   (-> fx
@@ -63,9 +63,9 @@
       (assoc ::remove-sms-listener (:confirmation-code-sms-listener db))))
 
 (re-frame/reg-fx
-  ::remove-sms-listener
-  (fn [subscription]
-    (sms-listener/remove-sms-listener subscription)))
+ ::remove-sms-listener
+ (fn [subscription]
+   (sms-listener/remove-sms-listener subscription)))
 
 (defn- sms-receive-handler [{confirmation-code :body}]
   (when-let [matches (re-matches #"(\d{4})" confirmation-code)]
@@ -79,15 +79,15 @@
        (re-frame/dispatch [:start-listening-confirmation-code-sms listener])))])
 
 (handlers/register-handler-fx
-  ::sign-up-success
-  [re-frame/trim-v (re-frame/inject-cofx :random-id)]
-  (fn [{:keys [db random-id]} [message-id]]
-    (-> {:db         db
-         :dispatch-n [;; create manual way for entering confirmation code
-                      (sign-up/enter-confirmation-code-event random-id)
-                      ;; create automatic way for receiving confirmation code
-                      start-listening-confirmation-code-sms-event]}
-        (message-seen message-id))))
+ ::sign-up-success
+ [re-frame/trim-v (re-frame/inject-cofx :random-id)]
+ (fn [{:keys [db random-id]} [message-id]]
+   (-> {:db         db
+        :dispatch-n [;; create manual way for entering confirmation code
+                     [:chat-received-message/add [console-chat/enter-confirmation-code-message]]
+                     ;; create automatic way for receiving confirmation code
+                     start-listening-confirmation-code-sms-event]}
+       (message-seen message-id))))
 
 (defn- extract-last-phone-number [chats]
   (let [phone-message (->> (get-in chats ["console" :messages])
@@ -98,9 +98,9 @@
     (get-in phone-message [:content :params :phone])))
 
 (handlers/register-handler-fx
-  ::sign-up-confirm
-  (fn [{:keys [db]} [confirmation-code message-id]]
-    (sign-up-confirm db confirmation-code message-id)))
+ ::sign-up-confirm
+ (fn [{:keys [db]} [confirmation-code message-id]]
+   (sign-up-confirm db confirmation-code message-id)))
 
 (defn- sign-up-confirmed [{:keys [db] :as fx} now]
   (let [last-phone-number (extract-last-phone-number (:chats db))
@@ -114,39 +114,40 @@
                                                          :last-updated now}))))
 
 (handlers/register-handler-fx
-  ::sign-up-confirm-response
-  [re-frame/trim-v (re-frame/inject-cofx :random-id)]
-  (fn [{:keys [db random-id now]} [{:keys [message status]} message-id]]
-    (cond-> {:db         db
-             :dispatch-n [[:received-message
-                           {:message-id   random-id
-                            :content      message
-                            :content-type const/text-content-type
-                            :outgoing     false
-                            :chat-id      const/console-chat-id
-                            :from         const/console-chat-id
-                            :to           "me"}]]}
-      message-id
-      (message-seen message-id)
+ ::sign-up-confirm-response
+ [re-frame/trim-v (re-frame/inject-cofx :random-id)]
+ (fn [{:keys [db random-id now]} [{:keys [message status]} message-id]]
+   (let [messages (cond-> []
 
-      (= "confirmed" status)
-      (sign-up-confirmed now)
+                    true
+                    (conj (console-chat/console-message {:content message
+                                                         :content-type const/text-content-type}))
 
-      (= "failed" status)
-      (update :dispatch-n conj (sign-up/incorrect-confirmation-code-event random-id)))))
+                    (= "failed" status)
+                    (conj console-chat/incorrect-confirmation-code-message))]
 
-(handlers/register-handler-fx
-  ::contacts-synced
-  [re-frame/trim-v (re-frame/inject-cofx :random-id)]
-  (fn [{:keys [db random-id now] :as cofx} [contacts]]
-    (-> {:db db}
-        (accounts-events/account-update {:signed-up?   true :last-updated now})
-        (assoc :dispatch (sign-up/contacts-synchronised-event random-id)))))
+     (cond-> {:db         db
+              :dispatch-n [[:chat-received-message/add messages]]}
+
+       message-id
+       (message-seen message-id)
+
+       (= "confirmed" status)
+       (sign-up-confirmed now)))))
 
 (handlers/register-handler-fx
-  ::http-request-failure
-  [re-frame/trim-v]
-  (fn [_ [original-event-vector]]
-    ;; TODO(janherich): in case of http request failure, we will try to hit http endpoint in loop forever,
-    ;; maybe it's better to cut it after N tries and display error message with explanation to user
-    {:dispatch-later [{:ms 1000 :dispatch original-event-vector}]}))
+ ::contacts-synced
+ [re-frame/trim-v (re-frame/inject-cofx :random-id)]
+ (fn [{:keys [db random-id now] :as cofx} [contacts]]
+   (-> {:db db}
+       (accounts-events/account-update {:signed-up? true
+                                        :last-updated now})
+       (assoc :dispatch [:chat-received-message/add [console-chat/contacts-synchronised-message]]))))
+
+(handlers/register-handler-fx
+ ::http-request-failure
+ [re-frame/trim-v]
+ (fn [_ [original-event-vector]]
+   ;; TODO(janherich): in case of http request failure, we will try to hit http endpoint in loop forever,
+   ;; maybe it's better to cut it after N tries and display error message with explanation to user
+   {:dispatch-later [{:ms 1000 :dispatch original-event-vector}]}))
