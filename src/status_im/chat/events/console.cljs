@@ -38,7 +38,7 @@
   (str url "/donate/0x%s"))
 
 (defn- faucet-response-event [message-id content]
-  [:chat-received-message/add 
+  [:chat-received-message/add
    [(console-chat/console-message {:message-id  message-id
                                    :content      content
                                    :content-type const/text-content-type})]])
