@@ -62,49 +62,37 @@
   (and (= console-chat-id chat-id)
        (console/commands-names command-name)))
 
-(register-handler  :check-commands-handlers!
-  (u/side-effect!
-    (fn [_ [_ {:keys [command message chat-id] :as params}]]
-      (let [{:keys [command] :as content} command]
-        (cond
-          (console-command? chat-id (:name command))
-          (dispatch [:invoke-console-command-handler! params])
 
-          (:has-handler command)
-          (dispatch [::invoke-command-handlers! params])
+(register-handler
+ :prepare-command!
+ (u/side-effect!
+  (fn [{:keys [current-public-key network-status] :as db}
+      [_ add-to-chat-id {{:keys [handler-data
+                                 command]
+                          :as   content} :command
+                         chat-id         :chat-id
+                         :as             params}]]
+    (let [clock-value   (messages/get-last-clock-value chat-id)
+          request       (:request handler-data)
+          hidden-params (->> (:params command)
+                             (filter :hidden)
+                             (map :name))
+          command'      (->> (prepare-command current-public-key chat-id clock-value request content)
+                             (cu/check-author-direction db chat-id))]
+      (dispatch [:update-message-overhead! chat-id network-status])
+      (dispatch [:set-chat-ui-props {:sending-in-progress? false}])
+      (dispatch [::send-command! add-to-chat-id (assoc params :command command') hidden-params])
+      (when (cu/console? chat-id)
+        (dispatch [:console-respond-command params]))))))
 
-          :else
-          (dispatch [:prepare-command! chat-id params])))
-      (dispatch [:set-chat-ui-props {:sending-in-progress? false}]))))
-
-(register-handler :prepare-command!
-  (u/side-effect!
-    (fn [{:keys [current-public-key network-status] :as db}
-         [_ add-to-chat-id {{:keys [handler-data
-                                    command]
-                             :as   content} :command
-                            chat-id         :chat-id
-                            :as             params}]]
-      (let [clock-value   (messages/get-last-clock-value chat-id)
-            request       (:request handler-data)
-            hidden-params (->> (:params command)
-                               (filter :hidden)
-                               (map :name))
-            command'      (->> (prepare-command current-public-key chat-id clock-value request content)
-                               (cu/check-author-direction db chat-id))]
-        (dispatch [:update-message-overhead! chat-id network-status])
-        (dispatch [:set-chat-ui-props {:sending-in-progress? false}])
-        (dispatch [::send-command! add-to-chat-id (assoc params :command command') hidden-params])
-        (when (cu/console? chat-id)
-          (dispatch [:console-respond-command params]))))))
-
-(register-handler ::send-command!
-  (u/side-effect!
-    (fn [_ [_ add-to-chat-id params hidden-params]]
-      (dispatch [::add-command add-to-chat-id params])
-      (dispatch [::save-command! add-to-chat-id params hidden-params])
-      (dispatch [::dispatch-responded-requests! params])
-      (dispatch [::send-command-protocol! params]))))
+(register-handler
+ ::send-command!
+ (u/side-effect!
+  (fn [_ [_ add-to-chat-id params hidden-params]]
+    (dispatch [::add-command add-to-chat-id params])
+    (dispatch [::save-command! add-to-chat-id params hidden-params])
+    (dispatch [::dispatch-responded-requests! params])
+    (dispatch [:send-command-protocol! params]))))
 
 (register-handler ::add-command
   (after (fn [_ [_ _ {:keys [handler]}]]
@@ -335,46 +323,47 @@
                                                       [:message :to] (:to message)))
                     (send-notification fcm-token (:message options)))))))))))
 
-(register-handler ::send-command-protocol!
-  (u/side-effect!
-    (fn [{:keys [web3 current-public-key chats network-status]
-          :accounts/keys [accounts current-account-id]
-          :contacts/keys [contacts] :as db}
-         [_ {:keys [chat-id command]}]]
-      (if (get-in contacts [chat-id :dapp?])
-        (when-let [text-message (get-in command [:content :handler-data :text-message])]
-          (handle-message-from-bot {:message text-message
-                                    :chat-id chat-id}))
-        (let [{:keys [public-key private-key]} (chats chat-id)
-              {:keys [group-chat public?]} (get-in db [:chats chat-id])
+(register-handler
+ :send-command-protocol!
+ (u/side-effect!
+  (fn [{:keys [web3 current-public-key chats network-status]
+       :accounts/keys [accounts current-account-id]
+       :contacts/keys [contacts] :as db}
+      [_ {:keys [chat-id command]}]]
+    (if (get-in contacts [chat-id :dapp?])
+      (when-let [text-message (get-in command [:content :handler-data :text-message])]
+        (handle-message-from-bot {:message text-message
+                                  :chat-id chat-id}))
+      (let [{:keys [public-key private-key]} (chats chat-id)
+            {:keys [group-chat public?]} (get-in db [:chats chat-id])
 
-              payload (-> command
-                          (select-keys [:content :content-type
-                                        :clock-value :show?])
-                          (assoc :timestamp (datetime/now-ms)))
-              payload (if (= network-status :offline)
-                        (assoc payload :show? false)
-                        payload)
-              options {:web3    web3
-                       :message {:from       current-public-key
-                                 :message-id (:message-id command)
-                                 :payload    payload}}]
-          (cond
-            (and group-chat (not public?))
-            (protocol/send-group-message! (assoc options
-                                            :group-id chat-id
-                                            :keypair {:public  public-key
-                                                      :private private-key}))
+            payload (-> command
+                        (select-keys [:content :content-type
+                                      :clock-value :show?])
+                        (assoc :timestamp (datetime/now-ms)))
+            payload (if (= network-status :offline)
+                      (assoc payload :show? false)
+                      payload)
+            options {:web3    web3
+                     :message {:from       current-public-key
+                               :message-id (:message-id command)
+                               :payload    payload}}]
+        (cond
+          (and group-chat (not public?))
+          (protocol/send-group-message! (assoc options
+                                               :group-id chat-id
+                                               :keypair {:public  public-key
+                                                         :private private-key}))
 
-            (and group-chat public?)
-            (protocol/send-public-group-message!
-              (let [username (get-in accounts [current-account-id :name])]
-                (assoc options :group-id chat-id
-                               :username username)))
+          (and group-chat public?)
+          (protocol/send-public-group-message!
+           (let [username (get-in accounts [current-account-id :name])]
+             (assoc options :group-id chat-id
+                    :username username)))
 
-            :else
-            (protocol/send-message! (assoc-in options
-                                              [:message :to] chat-id))))))))
+          :else
+          (protocol/send-message! (assoc-in options
+                                            [:message :to] chat-id))))))))
 
 (register-handler
  :add-request-message!

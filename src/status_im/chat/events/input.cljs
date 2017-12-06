@@ -6,6 +6,8 @@
             [status-im.chat.utils :as chat-utils]
             [status-im.chat.models :as model]
             [status-im.chat.models.input :as input-model]
+            [status-im.chat.models.commands :as commands-model]
+            [status-im.chat.models.message :as message-model]
             [status-im.chat.events.commands :as commands-events]
             [status-im.chat.events.animation :as animation-events]
             [status-im.bots.events :as bots-events]
@@ -401,38 +403,37 @@
     (request-command-data db command-params)))
 
 (handlers/register-handler-fx
-  ::send-command
-  [re-frame/trim-v]
-  (fn [{{:keys [current-public-key current-chat-id]
-         :accounts/keys [current-account-id] :as db} :db} [{:keys [command] :as command-message}]]
-    {:db (-> db
-             clear-seq-arguments
-             (set-chat-input-metadata nil)
-             (set-chat-input-text nil)
-             (model/set-chat-ui-props {:sending-in-progress? false}))
-     ;; TODO: refactor send-message.cljs to use atomic pure handlers and get rid of this dispatch
-     :dispatch [:check-commands-handlers! {:message (get-in db [:chats current-chat-id :input-text])
-                                           :command  command-message
-                                           :chat-id  current-chat-id
-                                           :identity current-public-key
-                                           :address  current-account-id}]}))
+ ::send-command
+ [re-frame/trim-v]
+ (fn [{{:keys [current-public-key current-chat-id]
+       :accounts/keys [current-account-id] :as db} :db} [{:keys [command] :as command-message}]]
+   (-> {:db (-> db
+                clear-seq-arguments
+                (set-chat-input-metadata nil)
+                (set-chat-input-text nil)
+                (model/set-chat-ui-props {:sending-in-progress? false}))}
+       (message-model/process-command {:message (get-in db [:chats current-chat-id :input-text])
+                                       :command  command-message
+                                       :chat-id  current-chat-id
+                                       :identity current-public-key
+                                       :address  current-account-id}))))
 
 (handlers/register-handler-fx
-  ::check-command-type
-  [re-frame/trim-v]
-  (fn [{{:keys [current-chat-id] :as db} :db} [on-send-jail-response params-template]]
-    (if on-send-jail-response
-      ;; `onSend` is defined, we have non-sendable command here, like `@browse`
-      {:db (-> db
-               (model/set-chat-ui-props {:result-box           on-send-jail-response
-                                         :sending-in-progress? false})
-               (animation-events/choose-predefined-expandable-height :result-box :max))
-       ::dismiss-keyboard nil}
-      ;; regular command message, we need to fetch preview before sending the command message
-      (request-command-data db (merge params-template
-                                      {:data-type           :preview
-                                       :event-after-creator (fn [command-message _]
-                                                              [::send-command command-message])})))))
+ ::check-command-type
+ [re-frame/trim-v]
+ (fn [{{:keys [current-chat-id] :as db} :db} [on-send-jail-response params-template]]
+   (if on-send-jail-response
+     ;; `onSend` is defined, we have non-sendable command here, like `@browse`
+     {:db (-> db
+              (model/set-chat-ui-props {:result-box           on-send-jail-response
+                                        :sending-in-progress? false})
+              (animation-events/choose-predefined-expandable-height :result-box :max))
+      ::dismiss-keyboard nil}
+     ;; regular command message, we need to fetch preview before sending the command message
+     (request-command-data db (merge params-template
+                                     {:data-type           :preview
+                                      :event-after-creator (fn [command-message _]
+                                                             [::send-command command-message])})))))
 
 (handlers/register-handler-fx
   :send-current-message
