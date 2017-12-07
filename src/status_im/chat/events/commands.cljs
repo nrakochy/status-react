@@ -41,7 +41,8 @@
             to          (get-in contacts [chat-id :address])
             jail-params {:parameters params
                          :context    (generate-context db chat-id to group-id)}]
-        {:call-jail {:jail-id                 jail-id
+        {:db        db
+         :call-jail {:jail-id                 jail-id
                      :path                    path
                      :params                  jail-params
                      :callback-events-creator (fn [jail-response]
