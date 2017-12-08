@@ -1,8 +1,8 @@
 (ns status-im.chat.events.input
-  (:require [clojure.string :as str]
+  (:require [clojure.string :as string]
             [re-frame.core :as re-frame]
             [taoensso.timbre :as log]
-            [status-im.chat.constants :as const]
+            [status-im.chat.constants :as constants]
             [status-im.chat.utils :as chat-utils]
             [status-im.chat.models :as model]
             [status-im.chat.models.input :as input-model]
@@ -60,7 +60,7 @@
       true
       (assoc-in [:chats current-chat-id :input-text] (input-model/text->emoji chat-text))
 
-      (and dapp? (str/blank? chat-text))
+      (and dapp? (string/blank? chat-text))
       (assoc-in [:chats current-chat-id :parameter-boxes :message] nil))))
 
 ;; TODO janherich: this is super fragile and won't work at all for group chats with bots.
@@ -69,10 +69,10 @@
 (defn call-on-message-input-change
   "Calls bot's `on-message-input-change` function"
   [{:keys [current-chat-id current-account-id chats local-storage] :as db}]
-  (let [chat-text (str/trim (or (get-in chats [current-chat-id :input-text]) ""))
+  (let [chat-text (string/trim (or (get-in chats [current-chat-id :input-text]) ""))
         {:keys [dapp?]} (get-in db [:contacts/contacts current-chat-id])]
     (cond-> {:db db}
-      (and dapp? (not (str/blank? chat-text)))
+      (and dapp? (not (string/blank? chat-text)))
       (assoc :call-jail-function {:chat-id    current-chat-id
                                   :function   :on-message-input-change
                                   :parameters {:message chat-text}
@@ -105,18 +105,18 @@
                         (get-in [:command :sequential-params]))]
     (if seq-params?
       (set-chat-seq-arg-input-text db arg)
-      (let [arg          (str/replace arg (re-pattern const/arg-wrapping-char) "")
+      (let [arg          (string/replace arg (re-pattern constants/arg-wrapping-char) "")
             command-name (first command)
             command-args (into [] (rest command))
             command-args (if (< index (count command-args))
                            (assoc command-args index arg)
                            (conj command-args arg))
             input-text   (str command-name
-                              const/spacing-char
+                              constants/spacing-char
                               (input-model/join-command-args command-args)
                               (when (and move-to-next?
                                          (= index (dec (count command-args))))
-                                const/spacing-char))]
+                                constants/spacing-char))]
         (set-chat-input-text db input-text)))))
 
 (defn load-chat-parameter-box
@@ -172,9 +172,9 @@
       chat-parameter-box-fx
       (merge chat-parameter-box-fx)
 
-      (and (= selection (+ (count const/command-char)
+      (and (= selection (+ (count constants/command-char)
                            (count (get-in command [:command :name]))
-                           (count const/spacing-char)))
+                           (count constants/spacing-char)))
            (get-in command [:command :sequential-params]))
       (merge (chat-input-focus new-db :seq-input-ref)))))
 
@@ -192,7 +192,7 @@
                                           :prev-command        name})
                 (set-chat-input-metadata metadata)
                 (set-chat-input-text (str (chat-utils/command-name command)
-                                          const/spacing-char
+                                          constants/spacing-char
                                           (when-not sequential-params
                                             (input-model/join-command-args prefill)))))
         fx  (assoc (load-chat-parameter-box db' command) :db db')]
@@ -208,14 +208,14 @@
       (as-> fx'
           (cond-> (update fx' :db
                           set-chat-seq-arg-input-text
-                          (str/join const/spacing-char prefill))
+                          (string/join constants/spacing-char prefill))
             (not prevent-auto-focus?)
             (merge fx' (chat-input-focus (:db fx') :seq-input-ref)))))))
 
 (defn set-contact-as-command-argument
   "Sets contact as command argument for active chat"
   [db {:keys [bot-db-key contact arg-index]}]
-  (let [name    (str/replace (:name contact) (re-pattern const/arg-wrapping-char) "")
+  (let [name    (string/replace (:name contact) (re-pattern constants/arg-wrapping-char) "")
         contact (select-keys contact [:address :whisper-identity :name :photo-path :dapp?])
         command-owner (get-in (input-model/selected-chat-command db) [:command :owner-id])]
     (-> db
@@ -434,6 +434,38 @@
                                        :event-after-creator (fn [command-message _]
                                                               [::send-command command-message])})))))
 
+(defn command-complete?
+  [chat-command]
+  (= :complete (input-model/command-completion chat-command)))
+
+(defn command-complete-fx
+  "command is complete, clear sequential arguments and proceed with command processing"
+  [db chat-command message-id current-time]
+  (-> db
+      clear-seq-arguments
+      (model/set-chat-ui-props {:sending-in-progress? true})
+      (proceed-command chat-command message-id current-time)))
+
+(defn command-not-complete-fx
+  "command is not complete, just add space after command if necessary"
+  [db input-text]
+  {:db (cond-> db
+         (not (input-model/text-ends-with-space? input-text))
+         (set-chat-input-text constants/spacing-char :append? true))})
+
+(defn no-command-fx
+  "no command detected, when not empty, proceed by sending text message without command processing"
+  [db input-text current-chat-id current-public-key]
+  (when-not (string/blank? input-text)
+    {:db (-> db
+             (set-chat-input-metadata nil)
+             (set-chat-input-text nil))
+     ;; TODO: refactor send-message.cljs to use atomic pure handlers and get rid of this dispatch
+     :dispatch [:prepare-message {:message  input-text
+                                  :chat-id  current-chat-id
+                                  :identity current-public-key
+                                  :address  (:accounts/current-account-id db)}]}))
+
 (handlers/register-handler-fx
   :send-current-message
   [(re-frame/inject-cofx :random-id)]
@@ -445,30 +477,13 @@
                                  (if (get-in selected-command [:command :sequential-params])
                                    (assoc selected-command :args
                                           (get-in db [:chats current-chat-id :seq-arguments]))
-                                   (update selected-command :args (partial remove str/blank?)))))]
+                                   (update selected-command :args (partial remove string/blank?)))))]
         (if (:command chat-command)
-          ;; current input contains command
-          (if (= :complete (input-model/command-completion chat-command))
-            ;; command is complete, clear sequential arguments and proceed with command processing
-            (-> db
-                clear-seq-arguments
-                (model/set-chat-ui-props {:sending-in-progress? true})
-                (proceed-command chat-command message-id current-time))
-            ;; command is not complete, just add space after command if necessary
-            {:db (cond-> db
-                   (not (input-model/text-ends-with-space? input-text))
-                   (set-chat-input-text const/spacing-char :append? true))})
-          ;; no command detected, when not empty, proceed by sending text message without command processing
-          (if (str/blank? input-text)
-            {:db db}
-            {:db (-> db
-                     (set-chat-input-metadata nil)
-                     (set-chat-input-text nil))
-             ;; TODO: refactor send-message.cljs to use atomic pure handlers and get rid of this dispatch
-             :dispatch [:prepare-message {:message  input-text
-                                          :chat-id  current-chat-id
-                                          :identity current-public-key
-                                          :address  (:accounts/current-account-id db)}]}))))))
+          ;; Returns true if current input contains command
+          (if (command-complete? chat-command)
+            (command-complete-fx db chat-command message-id current-time)
+            (command-not-complete-fx db input-text))
+          (no-command-fx db input-text current-chat-id current-public-key))))))
 
 ;; TODO: remove this handler and leave only helper fn once all invocations are refactored
 (handlers/register-handler-db
