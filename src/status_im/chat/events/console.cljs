@@ -94,17 +94,7 @@
 
 ;;;; Handlers
 
-;; TODO(janherich) remove this once send-message events are refactored
-(handlers/register-handler-fx
-  :invoke-console-command-handler!
-  [re-frame/trim-v (re-frame/inject-cofx :random-id)]
-  (fn [cofx [{:keys [chat-id command] :as command-params}]]
-    (let [fx-fn (get console-commands->fx (-> command :command :name))]
-      (-> cofx
-          (fx-fn command)
-          (update :dispatch-n (fnil conj []) [:prepare-command! chat-id command-params])))))
-
-;; TODO(janherich) remove this once send-message events are refactored
+;; TODO(alwx) remove this once send-message events are refactored
 (handlers/register-handler-fx
  :console-respond-command
  [(re-frame/inject-cofx :random-id-seq) re-frame/trim-v]

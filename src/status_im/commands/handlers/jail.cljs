@@ -26,10 +26,10 @@
       result
       (let [command' (assoc command :handler-data returned)
             params'  (assoc params :command command')] 
-        (dispatch [:prepare-command! chat-id params']))
+        (dispatch [:process-command chat-id params']))
 
       (not (or error handler-error))
-      (dispatch [:prepare-command! chat-id params])
+      (dispatch [:process-command chat-id params])
 
       :else nil)))
 
@@ -83,6 +83,7 @@
       (show-popup "Error" (s/join "\n" [message params]))
       (log/debug message params))))
 
+;; TODO(alwx): rewrite
 (reg-handler :command-handler!
   (after (print-error-message! "Error on command handling"))
   (handlers/side-effect! command-handler!))

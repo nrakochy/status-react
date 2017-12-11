@@ -1,7 +1,8 @@
 (ns status-im.chat.handlers.send-message
   (:require [clojure.string :as s]
-            [re-frame.core :refer [after dispatch path]]
+            [re-frame.core :as re-frame :refer [after dispatch path]]
             [status-im.chat.models.commands :as commands-model]
+            [status-im.chat.models.message :as message-model]
             [status-im.chat.events.console :as console]
             [status-im.chat.utils :as cu]
             [status-im.constants :refer [console-chat-id
@@ -15,112 +16,98 @@
             [status-im.utils.config :as config]
             [status-im.utils.clocks :as clocks]
             [status-im.utils.datetime :as datetime]
-            [status-im.utils.handlers :refer [register-handler] :as u]
+            [status-im.utils.handlers :refer [register-handler] :as handlers]
             [status-im.utils.random :as random]
             [status-im.utils.types :as types]
             [taoensso.timbre :as log]))
 
-(defn prepare-command
-  [identity chat-id clock-value
-   {request-params  :params
-    request-command :command
-    :keys           [prefill prefillBotDb]
-    :as             request}
-   {:keys [id params command to-message handler-data content-type]}]
-  (let [content  (if request
-                   {:command        request-command
-                    :params         (assoc request-params :bot-db (:bot-db params))
-                    :prefill        prefill
-                    :prefill-bot-db prefillBotDb}
-                   {:command (:name command)
-                    :scope   (:scope command)
-                    :params  params})
-        content' (assoc content :handler-data handler-data
-                                :type (name (:type command))
-                                :content-command (:name command)
-                                :content-command-scope-bitmask (:scope-bitmask command)
-                                :content-command-ref (:ref command)
-                                :bot (or (:bot command)
-                                         (:owner-id command)))]
-    {:message-id   id
-     :from         identity
-     :to           chat-id
-     :timestamp    (datetime/now-ms)
-     :content      content'
-     :content-type (or content-type
-                       (if request
-                         content-type-command-request
-                         content-type-command))
-     :outgoing     true
-     :to-message   to-message
-     :type         (:type command)
-     :has-handler  (:has-handler command)
-     :clock-value  (clocks/send clock-value)
-     :show?        true}))
+(re-frame/reg-event-fx
+  :process-command
+  message-model/send-interceptors
+  (fn [cofx [add-to-chat-id params]]
+    (message-model/process-command cofx params)))
 
-(defn console-command? [chat-id command-name]
-  (and (= console-chat-id chat-id)
-       (console/commands-names command-name)))
+(defn handle-message-from-bot [cofx {:keys [message chat-id]}]
+  (when-let [message (cond
+                       (string? message)
+                       {:message-id (random/id)
+                        :content (str message)
+                        :content-type text-content-type
+                        :outgoing false
+                        :chat-id chat-id
+                        :from chat-id
+                        :to "me"}
+
+                       (= "request" (:type message))
+                       {:message-id (random/id)
+                        :content (assoc (:content message) :bot chat-id)
+                        :content-type content-type-command-request
+                        :outgoing false
+                        :chat-id chat-id
+                        :from chat-id
+                        :to "me"})]
+    (message-model/receive cofx message)))
+
+(handlers/register-handler-fx
+  :send-message-from-jail
+  [re-frame/trim-v]
+  (fn [cofx [{:keys [chat-id message]}]]
+    (let [parsed-message (types/json->clj message)]
+      (handle-message-from-bot cofx {:message parsed-message
+                                     :chat-id chat-id}))))
+
+;; TODO(alwx): restructure
+(handlers/register-handler-fx
+  :send-command-protocol!
+  (fn [{{:keys [web3 current-public-key chats network-status]
+         :accounts/keys [accounts current-account-id]
+         :contacts/keys [contacts] :as db} :db :as cofx}
+       [_ {:keys [chat-id command]}]]
+    (if (get-in contacts [chat-id :dapp?])
+      (when-let [text-message (get-in command [:content :handler-data :text-message])]
+        (handle-message-from-bot cofx {:message text-message
+                                       :chat-id chat-id}))
+      (let [{:keys [public-key private-key]} (chats chat-id)
+            {:keys [group-chat public?]} (get-in db [:chats chat-id])
+
+            payload (-> command
+                        (select-keys [:content :content-type
+                                      :clock-value :show?])
+                        (assoc :timestamp (datetime/now-ms)))
+            payload (if (= network-status :offline)
+                      (assoc payload :show? false)
+                      payload)
+            options {:web3 web3
+                     :message {:from current-public-key
+                               :message-id (:message-id command)
+                               :payload payload}}]
+        (cond
+          (and group-chat (not public?))
+          (protocol/send-group-message! (assoc options
+                                          :group-id chat-id
+                                          :keypair {:public public-key
+                                                    :private private-key}))
+
+          (and group-chat public?)
+          (protocol/send-public-group-message!
+            (let [username (get-in accounts [current-account-id :name])]
+              (assoc options :group-id chat-id
+                             :username username)))
+
+          :else
+          (protocol/send-message! (assoc-in options
+                                            [:message :to] chat-id)))))))
 
 
-(register-handler
- :prepare-command!
- (u/side-effect!
-  (fn [{:keys [current-public-key network-status] :as db}
-      [_ add-to-chat-id {{:keys [handler-data
-                                 command]
-                          :as   content} :command
-                         chat-id         :chat-id
-                         :as             params}]]
-    (let [clock-value   (messages/get-last-clock-value chat-id)
-          request       (:request handler-data)
-          hidden-params (->> (:params command)
-                             (filter :hidden)
-                             (map :name))
-          command'      (->> (prepare-command current-public-key chat-id clock-value request content)
-                             (cu/check-author-direction db chat-id))]
-      (dispatch [:update-message-overhead! chat-id network-status])
-      (dispatch [:set-chat-ui-props {:sending-in-progress? false}])
-      (dispatch [::send-command! add-to-chat-id (assoc params :command command') hidden-params])
-      (when (cu/console? chat-id)
-        (dispatch [:console-respond-command params]))))))
 
-(register-handler
- ::send-command!
- (u/side-effect!
-  (fn [_ [_ add-to-chat-id params hidden-params]]
-    (dispatch [::add-command add-to-chat-id params])
-    (dispatch [::save-command! add-to-chat-id params hidden-params])
-    (dispatch [::dispatch-responded-requests! params])
-    (dispatch [:send-command-protocol! params]))))
 
-(register-handler ::add-command
-  (after (fn [_ [_ _ {:keys [handler]}]]
-           (when handler (handler))))
-  (fn [db [_ add-to-chat-id {:keys [chat-id command]}]]
-    (cu/add-message-to-db db add-to-chat-id chat-id command)))
 
-(register-handler
- ::save-command!
- (u/side-effect!
-  (fn [db [_ chat-id {:keys [command]} hidden-params]]
-    (let [preview (get-in db [:message-data :preview (:message-id command)])
-          command (cond-> (-> command
-                              (assoc :chat-id chat-id)
-                              (update-in [:content :params] #(apply dissoc % hidden-params))
-                              (dissoc :to-message :has-handler :raw-input))
-                    preview (assoc :preview (pr-str preview)))]
-      (dispatch [:upsert-chat! {:chat-id chat-id}])
-      (messages/save command)))))
 
-(register-handler ::dispatch-responded-requests!
-  (u/side-effect!
-    (fn [_ [_ {{:keys [to-message]} :command :keys [chat-id]}]]
-      (when to-message
-        (dispatch [:request-answered chat-id to-message])))))
 
-(register-handler ::invoke-command-handlers!
-  (u/side-effect!
+
+;; TODO(alwx): still here
+(register-handler :invoke-command-handlers!
+  (handlers/side-effect!
     (fn [{:keys [bot-db]
           :accounts/keys [accounts current-account-id]
           :contacts/keys [contacts] :as db}
@@ -154,7 +141,7 @@
                         (dispatch [:command-handler! chat-id orig-params res])))})))))
 
 (register-handler :prepare-message
-  (u/side-effect!
+  (handlers/side-effect!
     (fn [{:keys [network-status] :as db} [_ {:keys [chat-id identity message] :as params}]]
       (let [{:keys [group-chat public?]} (get-in db [:chats chat-id])
             clock-value (messages/get-last-clock-value chat-id)
@@ -189,14 +176,14 @@
  ::save-message!
  (after (fn [_ [_ params]]
           (dispatch [::send-message! params])))
- (u/side-effect!
+ (handlers/side-effect!
   (fn [_ [_ {:keys [chat-id message]}]]
     (dispatch [:upsert-chat! {:chat-id chat-id}])
     (messages/save message))))
 
 (register-handler
  ::send-dapp-message
- (u/side-effect!
+ (handlers/side-effect!
   (fn [{:accounts/keys [current-account-id] :as db} [_ chat-id {:keys [content]}]]
     (let [data (get-in db [:local-storage chat-id])]
       (status/call-function!
@@ -208,7 +195,7 @@
 
 (register-handler
  :received-bot-response
- (u/side-effect!
+ (handlers/side-effect!
   (fn [{:contacts/keys [contacts]} [_ {:keys [chat-id] :as params} {:keys [result bot-id] :as data}]]
     (let [{:keys [returned context]} result
           {:keys [markup text-message err]} returned
@@ -244,31 +231,8 @@
                      :from         chat-id
                      :to           "me"}]]))))))
 
-(defn handle-message-from-bot [{:keys [message chat-id]}]
-  (cond
-    (string? message)
-    (dispatch [:chat-received-message/add [{:message-id   (random/id)
-                                            :content      (str message)
-                                            :content-type text-content-type
-                                            :outgoing     false
-                                            :chat-id      chat-id
-                                            :from         chat-id
-                                            :to           "me"}]])
-
-    (= "request" (:type message))
-    (dispatch [:add-request-message!
-               {:content (:content message)
-                :chat-id chat-id}])))
-
-(register-handler :send-message-from-jail
-  (u/side-effect!
-    (fn [_ [_ {:keys [chat-id message]}]]
-      (let [parsed-message (types/json->clj message)]
-        (handle-message-from-bot {:message parsed-message
-                                  :chat-id chat-id})))))
-
 (register-handler :show-suggestions-from-jail
-  (u/side-effect!
+  (handlers/side-effect!
     (fn [_ [_ {:keys [chat-id markup]}]]
       (let [markup' (types/json->clj markup)
             result  (assoc-in {} [:result :returned :markup] markup')]
@@ -285,7 +249,7 @@
     (log/debug "send-notification message not sending because fcm-token is unavailable or notification flag is off")))
 
 (register-handler ::send-message!
-  (u/side-effect!
+  (handlers/side-effect!
     (fn [{:keys [web3 chats network-status]
           :accounts/keys [accounts current-account-id]
           :contacts/keys [contacts]
@@ -322,58 +286,3 @@
                 (do (protocol/send-message! (assoc-in options
                                                       [:message :to] (:to message)))
                     (send-notification fcm-token (:message options)))))))))))
-
-(register-handler
- :send-command-protocol!
- (u/side-effect!
-  (fn [{:keys [web3 current-public-key chats network-status]
-       :accounts/keys [accounts current-account-id]
-       :contacts/keys [contacts] :as db}
-      [_ {:keys [chat-id command]}]]
-    (if (get-in contacts [chat-id :dapp?])
-      (when-let [text-message (get-in command [:content :handler-data :text-message])]
-        (handle-message-from-bot {:message text-message
-                                  :chat-id chat-id}))
-      (let [{:keys [public-key private-key]} (chats chat-id)
-            {:keys [group-chat public?]} (get-in db [:chats chat-id])
-
-            payload (-> command
-                        (select-keys [:content :content-type
-                                      :clock-value :show?])
-                        (assoc :timestamp (datetime/now-ms)))
-            payload (if (= network-status :offline)
-                      (assoc payload :show? false)
-                      payload)
-            options {:web3    web3
-                     :message {:from       current-public-key
-                               :message-id (:message-id command)
-                               :payload    payload}}]
-        (cond
-          (and group-chat (not public?))
-          (protocol/send-group-message! (assoc options
-                                               :group-id chat-id
-                                               :keypair {:public  public-key
-                                                         :private private-key}))
-
-          (and group-chat public?)
-          (protocol/send-public-group-message!
-           (let [username (get-in accounts [current-account-id :name])]
-             (assoc options :group-id chat-id
-                    :username username)))
-
-          :else
-          (protocol/send-message! (assoc-in options
-                                            [:message :to] chat-id))))))))
-
-(register-handler
- :add-request-message!
- (u/side-effect!
-  (fn [_ [_ {:keys [content chat-id]}]]
-    (dispatch [:chat-received-message/add
-               [{:message-id  (random/id)
-                 :content      (assoc content :bot chat-id)
-                 :content-type content-type-command-request
-                 :outgoing     false
-                 :chat-id      chat-id
-                 :from         chat-id
-                 :to           "me"}]]))))

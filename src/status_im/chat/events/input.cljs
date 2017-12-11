@@ -402,21 +402,23 @@
   (fn [{:keys [db]} [command-params]]
     (request-command-data db command-params)))
 
+;; TODO(alwx): move to send-message
 (handlers/register-handler-fx
  ::send-command
- [re-frame/trim-v]
- (fn [{{:keys [current-public-key current-chat-id]
-       :accounts/keys [current-account-id] :as db} :db} [{:keys [command] :as command-message}]]
-   (-> {:db (-> db
-                clear-seq-arguments
-                (set-chat-input-metadata nil)
-                (set-chat-input-text nil)
-                (model/set-chat-ui-props {:sending-in-progress? false}))}
-       (message-model/process-command {:message (get-in db [:chats current-chat-id :input-text])
-                                       :command  command-message
-                                       :chat-id  current-chat-id
-                                       :identity current-public-key
-                                       :address  current-account-id}))))
+ message-model/send-interceptors
+ (fn [cofx [{:keys [command] :as command-message}]]
+   (let [{{:keys [current-public-key current-chat-id] :accounts/keys [current-account-id] :as db} :db} cofx]
+     (-> cofx
+         (assoc :db (-> db
+                        (clear-seq-arguments)
+                        (set-chat-input-metadata nil)
+                        (set-chat-input-text nil)
+                        (model/set-chat-ui-props {:sending-in-progress? false})))
+         (message-model/process-command {:message (get-in db [:chats current-chat-id :input-text])
+                                         :command command-message
+                                         :chat-id current-chat-id
+                                         :identity current-public-key
+                                         :address current-account-id})))))
 
 (handlers/register-handler-fx
  ::check-command-type

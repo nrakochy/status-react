@@ -101,6 +101,13 @@
 
 ;;;; Send message
 
+(def send-interceptors
+  [(re-frame/inject-cofx :random-id)
+   (re-frame/inject-cofx :random-id-seq)
+   (re-frame/inject-cofx :get-stored-chat)
+   (re-frame/inject-cofx :save-entities)
+   re-frame/trim-v])
+
 (defn- prepare-command
   [identity chat-id clock-value
    {request-params  :params
@@ -143,7 +150,7 @@
 ;; TODO(alwx): it's actually a prepare-command! handler
 (defn send-command
   [{{:keys [current-public-key network-status] :as db} :db
-    :keys [get-stored-chat random-id-seq] :as cofx} add-to-chat-id params]
+    :keys [get-stored-chat random-id-seq]} add-to-chat-id params]
   (let [{{:keys [handler-data
                  command]
           :as   content} :command
@@ -155,6 +162,7 @@
                            (map :name))
         command' (->> (prepare-command current-public-key chat-id clock-value request content)
                       (chat-utils/check-author-direction db chat-id))
+        preview (get-in db [:message-data :preview (:message-id command')])
         params' (assoc params :command command')]
     (cond-> {:db (-> db
                      (chat-utils/add-message-to-db add-to-chat-id chat-id params'))
@@ -178,31 +186,34 @@
 
       (:to-message command')
       (assoc :chat-requests/mark-as-answered {:chat-id chat-id
-                                              :message-id to-message})
-      ;; ::send-command-protocol!
+                                              :message-id (:to-message command')})
+
       true
       (assoc :dispatch-n [[:send-command-protocol! params']])
 
-      (chat-utils/console?)
+      (chat-utils/console? chat-id)
       (as-> cofx'
           (let [messages (console-events/console-respond-command-messages params' random-id-seq)]
-            (update cofx' :save-entities conj messages)))
+            (update cofx' :save-entities conj messages))))))
 
-      )))
-
+;; TODO(alwx) remove this once send-message events are refactored; also make use of it
+(defn invoke-console-command-handler
+  [cofx [{:keys [chat-id command] :as command-params}]]
+  (let [fx-fn (get console-events/console-commands->fx (-> command :command :name))]
+    (-> (fx-fn cofx command)
+        (send-command chat-id command-params))))
 
 ;; TODO(alwx): unified send for both commands and messages
 (defn process-command
-  [{:keys [db]} {:keys [command message chat-id] :as params}]
+  [{:keys [db random-id] :as cofx} {:keys [command message chat-id] :as params}]
   (let [{:keys [command] :as content} command]
     (-> {:db db}
 
         (as-> cofx'
             (cond
               (and (= constants/console-chat-id chat-id)
-                   (console-events/command-names (:name command)))
-              ;; TODO(alwx): should be restructured
-              (assoc cofx' :dispatch-n [[:invoke-console-command-handler! params]])
+                   (console-events/commands-names (:name command)))
+              (invoke-console-command-handler (merge cofx cofx') params)
 
               (:has-handler command)
               ;; TODO(alwx): should be restructured
